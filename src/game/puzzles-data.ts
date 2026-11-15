@@ -1,0 +1,22 @@
+/* 自动生成，勿手改。运行 npm run gen 重新生成。 */
+export interface RawPuzzle {
+  id: string
+  name: string
+  width: number
+  height: number
+  difficulty: 'easy' | 'medium' | 'hard' | 'custom'
+  series: string
+  /** 题面编码串（格式由 src/game/puzzles.ts 解析） */
+  board: string
+  /** 参考解编码串（没有则留空） */
+  solution?: string
+}
+
+export const RAW_PUZZLES: RawPuzzle[] = [
+  { id: "nurikabe-6x6-lqg6bl", name: "水岸初识", width: 6, height: 6, difficulty: 'easy', series: "入门", board: "000000010101000000010101004000000001", solution: "111111121212111111121212112111122212" },
+  { id: "nurikabe-7x7-lqg6bm", name: "礁石浅滩", width: 7, height: 7, difficulty: 'easy', series: "入门", board: "0000000000300000400000001010000000003000100000000", solution: "1111111121222112211111212121111111112221211111111" },
+  { id: "nurikabe-8x8-lqg6bn", name: "群岛回廊", width: 8, height: 8, difficulty: 'medium', series: "进阶", board: "0000000001010301000000000001000100000000030001010000000002030101", solution: "1111111112121212111112111212121212111111121212121112111122121212" },
+  { id: "nurikabe-9x9-lqg6bo", name: "潮汐迷宫", width: 9, height: 9, difficulty: 'medium', series: "进阶", board: "000000000010300010000000000000101010000000000030101010000000000010100030000000000", solution: "111111111121222121111111111121212121121111111121212121111111111121212221111111111" },
+  { id: "nurikabe-10x10-lqg6bp", name: "深海断层", width: 10, height: 10, difficulty: 'hard', series: "挑战", board: "0000000000030000000100000000000101050501000000000001010100010000000000010101000100000000000100030003", solution: "1111111111122212221211111211111212121212111111121112121212121111111211121212121211111111111212221222" },
+  { id: "nurikabe-10x10-lqg6bq", name: "万岛之海", width: 10, height: 10, difficulty: 'hard', series: "挑战", board: "0000000000010101010300000000000101030000000000000001010100010000000000010101030300000000000101010100", solution: "1111111111121212121211111111121212122212111111111112121212121111111211121212121211111111121212121212" },
+]

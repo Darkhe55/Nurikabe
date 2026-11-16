@@ -57,15 +57,33 @@ for (const e of entries) {
     errors++
     continue
   }
-  if (e.solution.length !== size) {
+  if (e.solution.length !== 0 && e.solution.length !== size) {
     console.error(`[check] ${e.id} 解串长度 ${e.solution.length} != ${size}`)
     errors++
     continue
   }
 
   const clues = decodeClues(e.board, size)
+  if (!clues) {
+    console.error(`[check] ${e.id} 线索编码非法`)
+    errors++
+    continue
+  }
+  if (typeof e.solution !== 'string' || e.solution.length === 0) {
+    // 识图导入的大题可能没有参考解：只做结构校验，不参与唯一解审计
+    let clueTotal = 0
+    for (const c of clues) if (c > 0) clueTotal++
+    if (clueTotal === 0) {
+      console.error(`[check] ${e.id} 没有任何数字线索`)
+      errors++
+    } else {
+      console.warn(`[check] ${e.id} 没有参考解（识图导入），跳过唯一解校验`)
+      warnings++
+    }
+    continue
+  }
   const solution = decodeCells(e.solution, size)
-  if (!clues || !solution) {
+  if (!solution) {
     console.error(`[check] ${e.id} 线索/解编码非法`)
     errors++
     continue

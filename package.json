@@ -13,6 +13,7 @@
     "start": "node scripts/dev.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
+    "import-image": "node scripts/import-image.mjs",
     "gen": "node scripts/gen-puzzles.mjs",
     "check": "node scripts/check.mjs",
     "ui-check": "node scripts/ui-check.mjs",

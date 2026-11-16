@@ -4,20 +4,23 @@
  * 用法：
  *   node scripts/import-image.mjs <图片路径> [--width 20 --height 15 | --size 20]
  *        [--name 名称] [--series human] [--append] [--verify] [--map 0=4,3=7] [--dry]
+ *        [--rect]   # 强制按完整矩形处理（题图外框线缺失导致外部格误判时用）
  *
  * 流程：
  *   1. Playwright + Edge 打开发图到 canvas，取像素；
- *   2. 投影暗像素找网格线（自动剔除杂线），得到 w×h 与每格中心；
- *   3. 每格抠出墨迹连通块 → 1–2 个数字字形，按字高归一化成 20×20 灰度；
- *   4. 字形聚类得到「数字簇」，多字体模板匹配定值（0–9），拼回每格数字；
- *   5. 校验数字范围（1–w×h）、数字格数量；
- *   6. 预览线索网格；--map 可人工覆盖某个字形簇的数字；
- *   7. --append 写入 src/game/puzzles-data.ts（与现有题库条目同一格式）；
- *   8. --verify 调项目 solver 校验唯一解，算出参考解就一起写入，超时只警告。
+ *   2. 投影暗像素找网格线（自动剔除杂线、补齐被短边界线漏掉的格线），得到 w×h；
+ *   3. 逐格检查四条边是否都画了格线 → 判断是否「题板内」；缺口/内部空洞写为外部格
+ *      —— 线索里记为 -1，编码为 'x'（与自定义题板的「外部区域」语义一致）；
+ *   4. 每格抠出墨迹连通块 → 1–2 个数字字形，按字高归一化成 20×20 灰度；
+ *   5. 字形聚类得到「数字簇」，多字体模板匹配定值（0–9），拼回每格数字；
+ *   6. 校验数字范围（1–题板内格数）、数字格数量，打印异形题板形状与外部区域分布；
+ *   7. --append 写入 src/game/puzzles-data.ts 并回读解码校验；
+ *   8. --verify 调项目 solver 校验唯一解，算出参考解就一起写入，超时只警告
+ *      （异形大题求解可能超时，属正常情况）。
  *
  * 已知限制：
- *   - 只支持「网格 + 格子里的数字线索」的题图；带外部区域（异形题板）的题图
- *     目前会按完整矩形处理，需要手动修正（数墙自定义题板支持外部区域）；
+ *   - 题图需要是「格线 + 格子里的数字线索」的画法；外部区域靠「四条边都缺格线」判断，
+ *     若题图外框线缺失、或外部区域里有别的印刷内容，可能需要人工核对；
  *   - `npm run gen` 会重写 puzzles-data.ts，识图导入的条目会被覆盖。
  */
 
@@ -25,7 +28,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { chromium } from 'playwright-core'
 import { countSolutions, findSolution } from '../src/game/solver.ts'
-import { encodeCells, encodeClues } from '../src/game/types.ts'
+import { decodeCells, decodeClues, encodeCells, encodeClues, OUTSIDE } from '../src/game/types.ts'
 
 const S = 20
 
@@ -56,7 +59,7 @@ const arg = (flag, fallback = null) => {
 const imageArg = argv.find((a) => !a.startsWith('--'))
 if (!imageArg) {
   console.error(
-    '用法：node scripts/import-image.mjs <图片路径> [--width 20 --height 15 | --size 20] [--name 名称] [--series human] [--append] [--verify] [--map 0=4,3=7] [--dry]',
+    '用法：node scripts/import-image.mjs <图片路径> [--width 20 --height 15 | --size 20] [--name 名称] [--series human] [--append] [--verify] [--map 0=4,3=7] [--dry] [--rect]',
   )
   process.exit(1)
 }
@@ -72,6 +75,7 @@ const sizeOpt = Number(arg('--size', '0')) || 0
 const append = has('--append')
 const verify = has('--verify')
 const dry = has('--dry')
+const rectMode = has('--rect')
 const nameOpt = arg('--name')
 const series = arg('--series', 'human')
 
@@ -117,7 +121,7 @@ await page.setContent('<canvas id="c"></canvas>')
 const dataUrl = 'data:image/png;base64,' + fs.readFileSync(IMAGE).toString('base64')
 
 const analyzed = await page.evaluate(
-  async ({ u, S, widthOpt, heightOpt, sizeOpt }) => {
+  async ({ u, S, widthOpt, heightOpt, sizeOpt, rectMode }) => {
     const img = new Image()
     img.src = u
     await img.decode()
@@ -184,8 +188,71 @@ const analyzed = await page.evaluate(
       }
       return out
     }
-    const xs = cleanLines(clusters(colCount, H * 0.4)).map((c) => c.center)
-    const ys = cleanLines(clusters(rowCount, W * 0.4)).map((c) => c.center)
+    // —— 网格线：先按长线识别（占图幅 40%）；异形题板的短边界线会漏，
+    //     再用「格距等差格点」补齐（缺失位置用附近暗像素峰值校正）——
+    const findLines = (counts, span) => {
+      let raw = clusters(counts, span * 0.4)
+      if (raw.length < 3) raw = clusters(counts, span * 0.15)
+      return cleanLines(raw).map((c) => c.center)
+    }
+    const linePitch = (lines) => {
+      if (lines.length < 2) return 0
+      const diffs = []
+      for (let i = 1; i < lines.length; i++) diffs.push(lines[i] - lines[i - 1])
+      return median(diffs)
+    }
+    const completeLattice = (lines, counts) => {
+      if (lines.length < 2) return lines
+      const pitch0 = linePitch(lines)
+      if (!(pitch0 >= 4)) return lines
+      // 给每条已识别线编号，再用最小二乘拟合 line = a + b·k（消除格距累计误差）
+      const base0 = lines[0]
+      const pts = lines.map((c) => [Math.round((c - base0) / pitch0), c])
+      let n = pts.length
+      let sk = 0
+      let sc = 0
+      let skk = 0
+      let skc = 0
+      for (const [k, c] of pts) {
+        sk += k
+        sc += c
+        skk += k * k
+        skc += k * c
+      }
+      const den = n * skk - sk * sk
+      const b = den ? (n * skc - sk * sc) / den : pitch0
+      const a = (sc - b * sk) / n
+      if (!(b >= 4)) return lines
+      const known = new Map()
+      for (const [k, c] of pts) if (!known.has(k)) known.set(k, c)
+      const ks = [...known.keys()]
+      const kMin = Math.min(...ks)
+      const kMax = Math.max(...ks)
+      const out = []
+      for (let k = kMin; k <= kMax; k++) {
+        if (known.has(k)) {
+          out.push(known.get(k))
+          continue
+        }
+        const predicted = a + b * k
+        // 缺失格点：在预测位置 ±2px 找暗像素最多处；证据够强才用它当线心
+        const center = Math.round(predicted)
+        let best = center
+        let bestVal = -1
+        for (let d = -2; d <= 2; d++) {
+          const i = center + d
+          if (i < 0 || i >= counts.length) continue
+          if (counts[i] > bestVal) {
+            bestVal = counts[i]
+            best = i
+          }
+        }
+        out.push(bestVal >= b * 0.45 ? best : predicted)
+      }
+      return out
+    }
+    const xs = completeLattice(findLines(colCount, H), colCount)
+    const ys = completeLattice(findLines(rowCount, W), rowCount)
     if (xs.length < 3 || ys.length < 3) {
       throw new Error(`没有识别到完整网格（竖线 ${xs.length}、横线 ${ys.length}）。`)
     }
@@ -197,6 +264,46 @@ const analyzed = await page.evaluate(
       throw new Error(
         `网格尺寸不匹配：识别到 ${w}×${h}，指定 ${wantW || w}×${wantH || h}。可用 --width/--height 覆盖。`,
       )
+    }
+
+    // —— 异形题板：逐格检查四条边是否真的画了格线 ——
+    // 题板内的格子四面都有线（内部线或题板外框）；缺口/内部空洞的格子缺边 → 外部区域。
+    const EDGE_TOL = 2
+    const edgeFrac = (horizontal, fixed, from, to) => {
+      const f = Math.round(fixed)
+      const n = Math.max(1, Math.round(to - from))
+      let hit = 0
+      for (let t = 0; t < n; t++) {
+        const p = Math.round(from + ((t + 0.5) * (to - from)) / n)
+        let on = false
+        for (let d = -EDGE_TOL; d <= EDGE_TOL; d++) {
+          if (horizontal ? dark(p, f + d) : dark(f + d, p)) {
+            on = true
+            break
+          }
+        }
+        if (on) hit++
+      }
+      return hit / n
+    }
+    const outside = []
+    const edgeAmbiguous = []
+    for (let cy = 0; cy < h; cy++) {
+      for (let cx = 0; cx < w; cx++) {
+        const top = edgeFrac(true, ys[cy], xs[cx] + 2, xs[cx + 1] - 2)
+        const bottom = edgeFrac(true, ys[cy + 1], xs[cx] + 2, xs[cx + 1] - 2)
+        const left = edgeFrac(false, xs[cx], ys[cy] + 2, ys[cy + 1] - 2)
+        const right = edgeFrac(false, xs[cx + 1], ys[cy] + 2, ys[cy + 1] - 2)
+        const minEdge = Math.min(top, bottom, left, right)
+        outside.push(rectMode ? 0 : minEdge < 0.5 ? 1 : 0)
+        if (!rectMode && minEdge > 0.25 && minEdge < 0.85) {
+          edgeAmbiguous.push({
+            cx,
+            cy,
+            edges: [top, bottom, left, right].map((v) => Number(v.toFixed(2))),
+          })
+        }
+      }
     }
 
     // —— 每格墨迹连通块 → 数字字形 ——
@@ -277,9 +384,9 @@ const analyzed = await page.evaluate(
         )
       }
     }
-    return { W, H, w, h, xs, ys, cells, dropped }
+    return { W, H, w, h, xs, ys, cells, dropped, outside, edgeAmbiguous }
   },
-  { u: dataUrl, S, widthOpt, heightOpt, sizeOpt },
+  { u: dataUrl, S, widthOpt, heightOpt, sizeOpt, rectMode },
 )
 
 // —— 数字模板 0–9 ——
@@ -340,9 +447,15 @@ await browser.close()
 
 // ───────────────────────── Node 侧：聚类 + 定值 ─────────────────────────
 
-const { w, h, cells } = analyzed
+const { w, h, cells, outside: outsideMask } = analyzed
 const size = w * h
-const maxValue = size
+const outside = outsideMask.map((v) => v === 1)
+const outsideIndex = []
+for (let i = 0; i < size; i++) if (outside[i]) outsideIndex.push(i)
+const outsideCount = outsideIndex.length
+const playable = size - outsideCount
+const maxValue = Math.max(1, playable)
+if (rectMode) console.log('[import] --rect：强制按完整矩形处理，不识别外部区域。')
 
 function dist(a, b) {
   let s = 0
@@ -472,7 +585,8 @@ for (let k = 0; k < info.length; k++) if (digits[k] < 0) digits[k] = info[k].ran
 
 console.log(
   `[import] ${path.basename(IMAGE)}：${analyzed.W}×${analyzed.H}px，网格 ${w}×${h}，` +
-    `字形 ${glyphs.length} 个 → ${info.length} 簇`,
+    `字形 ${glyphs.length} 个 → ${info.length} 簇` +
+    (outsideCount ? `，外部格 ${outsideCount} 个 / 题板内 ${playable} 格` : '，矩形题板'),
 )
 for (let k = 0; k < info.length; k++) {
   const [first, second] = info[k].ranked
@@ -491,7 +605,13 @@ for (let k = 0; k < info.length; k++) {
 }
 const clues = new Array(size).fill(0)
 const suspicious = []
+const outsideWithInk = []
 for (let i = 0; i < size; i++) {
+  if (outside[i]) {
+    clues[i] = OUTSIDE
+    if ((cellDigits[i] ?? []).some((d) => d !== undefined)) outsideWithInk.push(i)
+    continue
+  }
   const list = cellDigits[i]
   let value = 0
   let ok = list.length > 0
@@ -510,14 +630,84 @@ for (let i = 0; i < size; i++) {
   if (ok === false) clues[i] = 0
 }
 
+// —— 外部区域分布（4 连通块；便于人工核对异形题板形状） ——
+const outsideRegions = []
+{
+  const seen = new Uint8Array(size)
+  for (let start = 0; start < size; start++) {
+    if (!outside[start] || seen[start]) continue
+    const stack = [start]
+    seen[start] = 1
+    const comp = []
+    while (stack.length) {
+      const i = stack.pop()
+      comp.push(i)
+      const x = i % w
+      const y = (i / w) | 0
+      for (const [dx, dy] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ]) {
+        const nx = x + dx
+        const ny = y + dy
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
+        const j = ny * w + nx
+        if (!outside[j] || seen[j]) continue
+        seen[j] = 1
+        stack.push(j)
+      }
+    }
+    let minX = w
+    let maxX = -1
+    let minY = h
+    let maxY = -1
+    let touchesEdge = false
+    for (const i of comp) {
+      const x = i % w
+      const y = (i / w) | 0
+      if (x < minX) minX = x
+      if (x > maxX) maxX = x
+      if (y < minY) minY = y
+      if (y > maxY) maxY = y
+      if (x === 0 || y === 0 || x === w - 1 || y === h - 1) touchesEdge = true
+    }
+    outsideRegions.push({ size: comp.length, minX, maxX, minY, maxY, touchesEdge })
+  }
+  outsideRegions.sort((a, b) => b.size - a.size)
+}
+
 // —— 预览 ——
 const clueCount = clues.reduce((a, v) => a + (v > 0 ? 1 : 0), 0)
 const pad2 = String(maxValue).length + 1
-console.log(`\n识别线索网格：${w}×${h}，线索 ${clueCount} 个`)
+const outsideNote = outsideCount ? `，外部格 ${outsideCount} 个（题板内 ${playable} 格）` : ''
+console.log(`\n识别线索网格：${w}×${h}，线索 ${clueCount} 个${outsideNote}`)
 for (let y = 0; y < h; y++) {
   const row = []
-  for (let x = 0; x < w; x++) row.push(clues[y * w + x] ? String(clues[y * w + x]).padStart(pad2) : '.'.padStart(pad2))
+  for (let x = 0; x < w; x++) {
+    const v = clues[y * w + x]
+    if (v === OUTSIDE) row.push('x'.padStart(pad2))
+    else row.push(v ? String(v).padStart(pad2) : '.'.padStart(pad2))
+  }
   console.log(String(y + 1).padStart(2) + ' |' + row.join(''))
+}
+if (outsideCount) {
+  const holes = outsideRegions.filter((r) => !r.touchesEdge).length
+  const notches = outsideRegions.length - holes
+  console.log(
+    `\n异形题板：外部区域 ${outsideCount} 格，连成 ${outsideRegions.length} 块` +
+      `（边缘缺口 ${notches} 个，内部空洞 ${holes} 个）；编码 'x' / OUTSIDE=-1`,
+  )
+  for (const r of outsideRegions.slice(0, 12)) {
+    console.log(
+      `  外部${r.touchesEdge ? '缺口' : '空洞'}：行 ${r.minY + 1}–${r.maxY + 1}，` +
+        `列 ${r.minX + 1}–${r.maxX + 1}（${r.size} 格）`,
+    )
+  }
+  if (outsideRegions.length > 12) {
+    console.log(`  …另有 ${outsideRegions.length - 12} 个外部区`)
+  }
 }
 if (!clueCount) console.warn('[import] 没有识别到任何数字线索，无法作为数墙题目。')
 if (suspicious.length) {
@@ -526,6 +716,24 @@ if (suspicious.length) {
       suspicious
         .slice(0, 8)
         .map((i) => `(${(i % w) + 1},${Math.floor(i / w) + 1})`)
+        .join(' '),
+  )
+}
+if (outsideWithInk.length) {
+  console.warn(
+    `[import] 有 ${outsideWithInk.length} 个外部格里检测到墨迹，边界可能识别有误：` +
+      outsideWithInk
+        .slice(0, 8)
+        .map((i) => `(${(i % w) + 1},${Math.floor(i / w) + 1})`)
+        .join(' '),
+  )
+}
+if (!rectMode && analyzed.edgeAmbiguous?.length) {
+  console.warn(
+    `[import] 这些格子的格线残缺/偏淡，外部区域判定可能不准：` +
+      analyzed.edgeAmbiguous
+        .slice(0, 8)
+        .map((c) => `(${c.cx + 1},${c.cy + 1})[${c.edges.join('/')}]`)
         .join(' '),
   )
 }
@@ -577,7 +785,7 @@ if (!append) {
 
 // —— 写入题库 ——
 const id = arg('--id', `nurikabe-img-${w}x${h}-${Date.now().toString(36)}`)
-const name = nameOpt || `识图 · ${w}×${h}`
+const name = nameOpt || `识图 · ${w}×${h}${outsideCount ? '（异形）' : ''}`
 const board = encodeClues(clues)
 const entry =
   `  { id: ${JSON.stringify(id)}, name: ${JSON.stringify(name)}, width: ${w}, height: ${h}, ` +
@@ -587,6 +795,44 @@ const dataFile = path.resolve('src/game/puzzles-data.ts')
 let text = fs.readFileSync(dataFile, 'utf8').replace(/\r\n/g, '\n')
 const marker = text.lastIndexOf('\n]')
 if (marker < 0) throw new Error('puzzles-data.ts 格式异常：找不到结尾 ]')
-text = text.slice(0, marker + 1) + '\n' + entry + text.slice(marker + 1)
+text = text.slice(0, marker + 1) + entry + text.slice(marker + 1)
 fs.writeFileSync(dataFile, text)
 console.log(`[import] 已写入 src/game/puzzles-data.ts：${id} ${name}`)
+
+// —— 回读校验：从题库文件里把刚写入的条目读出来解码，确认外部格与线索都能还原 ——
+const written = fs.readFileSync(dataFile, 'utf8')
+const start = written.indexOf(`{ id: ${JSON.stringify(id)}`)
+if (start < 0) throw new Error('[import] 回读校验失败：题库文件里找不到刚写入的条目')
+const lineEnd = written.indexOf('\n', start)
+const writtenLine = written.slice(start, lineEnd < 0 ? undefined : lineEnd)
+const boardMatch = /board: ("(?:[^"\\]|\\.)*")/.exec(writtenLine)
+const solutionMatch = /solution: ("(?:[^"\\]|\\.)*")/.exec(writtenLine)
+if (!boardMatch) throw new Error('[import] 回读校验失败：条目里没有 board 字段')
+const decoded = decodeClues(JSON.parse(boardMatch[1]), size)
+if (!decoded) throw new Error('[import] 回读校验失败：board 无法解码')
+let mismatch = -1
+for (let i = 0; i < size; i++) {
+  if (decoded[i] !== clues[i]) {
+    mismatch = i
+    break
+  }
+}
+if (mismatch >= 0) {
+  throw new Error(
+    `[import] 回读校验失败：格 (${(mismatch % w) + 1},${Math.floor(mismatch / w) + 1}) ` +
+      `解码为 ${decoded[mismatch]}，应为 ${clues[mismatch]}`,
+  )
+}
+const outsideReadBack = decoded.reduce((a, v) => a + (v === OUTSIDE ? 1 : 0), 0)
+console.log(
+  `[import] 回读校验通过：线索串 ${size} 格解码一致，外部格 ${outsideReadBack}/${outsideCount}`,
+)
+if (solution && solutionMatch) {
+  const decodedSolution = decodeCells(JSON.parse(solutionMatch[1]), size)
+  if (!decodedSolution) throw new Error('[import] 回读校验失败：solution 无法解码')
+  if (encodeCells(decodedSolution) !== solution) {
+    throw new Error('[import] 回读校验失败：solution 编码往返不一致')
+  }
+  const solutionOutside = decodedSolution.reduce((a, v) => a + (v === OUTSIDE ? 1 : 0), 0)
+  console.log(`[import] 参考解回读校验通过：外部格 ${solutionOutside} 个`)
+}

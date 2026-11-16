@@ -12,6 +12,7 @@ import {
   decodeCells,
   decodeClues,
   givensFromClues,
+  OUTSIDE,
   WHITE,
   type WallPuzzle,
   type WallState,
@@ -49,11 +50,20 @@ for (const raw of RAW_PUZZLES) {
     if (solution) {
       let valid = true
       for (let i = 0; i < size; i++) {
+        const clue = clues[i]!
+        if (clue === OUTSIDE) {
+          // 异形题板：外部区域在参考解里也必须是 OUTSIDE
+          if (solution[i] !== OUTSIDE) {
+            valid = false
+            break
+          }
+          continue
+        }
         if (solution[i] !== 1 && solution[i] !== 2) {
           valid = false
           break
         }
-        if (clues[i]! > 0 && solution[i] !== WHITE) valid = false
+        if (clue > 0 && solution[i] !== WHITE) valid = false
       }
       if (valid) {
         puzzle.solution = solution
